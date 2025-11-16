@@ -112,15 +112,28 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
             skipped_stop_token_id = None
 
         # 1) Detokenize the new token ids incrementally.
-        # TODO(woosuk): This method becomes very inefficient when the number of
-        # new_token_ids is more than 1. We need to optimize this.
+        # Optimize for batch processing when possible.
         stop_check_offset = len(self.output_text)
-        for new_token_id in new_token_ids:
-            self.token_ids.append(new_token_id)
-            self.output_text += self.decode_next(new_token_id)
-            # Support min_tokens, see https://github.com/vllm-project/vllm/pull/22014
-            if self.min_tokens and len(self.output_token_ids) <= self.min_tokens:
-                stop_check_offset = len(self.output_text)
+
+        # Check if we're crossing the min_tokens threshold.
+        # If so, we need to process tokens one-by-one to accurately track
+        # the stop_check_offset for stop string detection.
+        if (
+            self.min_tokens
+            and len(self.output_token_ids) < self.min_tokens
+            and len(self.output_token_ids) + len(new_token_ids) > self.min_tokens
+        ):
+            # Slow path: crossing threshold, process one by one
+            for new_token_id in new_token_ids:
+                self.token_ids.append(new_token_id)
+                self.output_text += self.decode_next(new_token_id)
+                if self.min_tokens and len(self.output_token_ids) <= self.min_tokens:
+                    stop_check_offset = len(self.output_text)
+        else:
+            # Fast path: batch process all tokens
+            self.token_ids.extend(new_token_ids)
+            new_text = self._decode_tokens_batch(new_token_ids)
+            self.output_text += new_text
 
         if skipped_stop_token_id is not None:
             # Cleanup after skipping detokenization.
@@ -145,6 +158,14 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
     @abstractmethod
     def decode_next(self, next_token_id: int) -> str:
         raise NotImplementedError
+
+    def _decode_tokens_batch(self, token_ids: list[int]) -> str:
+        """Batch decode multiple tokens. Default implementation processes
+        one-by-one. Subclasses can override for optimized batch processing."""
+        result = ""
+        for token_id in token_ids:
+            result += self.decode_next(token_id)
+        return result
 
     def get_next_output_text(self, finished: bool, delta: bool) -> str:
         """If delta is True, only new text since the last call to
@@ -311,6 +332,36 @@ class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):
         self.read_offset = read_offset
 
         return decoded_text
+
+    def _decode_tokens_batch(self, token_ids: list[int]) -> str:
+        """Optimized batch decoding for SlowIncrementalDetokenizer.
+
+        Processes multiple tokens at once while maintaining incremental state.
+        """
+        result = ""
+        # Calculate the base length (where the new tokens start)
+        base_len = len(self.token_ids) - len(token_ids)
+
+        for i, token_id in enumerate(token_ids):
+            # Call detokenize_incrementally with the tokens up to this point
+            new_tokens, decoded_text, prefix_offset, read_offset = (
+                detokenize_incrementally(
+                    tokenizer=self.tokenizer,
+                    all_input_ids=self.token_ids[: base_len + i + 1],
+                    prev_tokens=self.tokens,
+                    prefix_offset=self.prefix_offset,
+                    read_offset=self.read_offset,
+                    skip_special_tokens=self.skip_special_tokens,
+                    spaces_between_special_tokens=self.spaces_between_special_tokens,
+                )
+            )
+            # Update state
+            self.tokens.extend(new_tokens)
+            self.prefix_offset = prefix_offset
+            self.read_offset = read_offset
+            result += decoded_text
+
+        return result
 
 
 def check_stop_strings(
